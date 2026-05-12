@@ -1,14 +1,13 @@
 # checkout 済み Git リポジトリを使う
 
 TorchFont の中心ワークフローでは、Git リポジトリの同期自体は
-TorchFont の外で行います。clone / update した checkout を
-`GlyphDataset` に渡してください。
+TorchFont ではなく Git 側で行います（このリポジトリの submodule
+コマンドなど）。更新した checkout を `GlyphDataset` に渡してください。
 
 ## 基本形
 
 ```bash
-git clone --depth 1 https://github.com/FortAwesome/Font-Awesome \
-  data/fortawesome/font-awesome
+git submodule update --init --depth 1 -- data/fortawesome/font-awesome
 ```
 
 ```python
@@ -58,31 +57,25 @@ GlyphDataset(
 ```python
 GlyphDataset(
     root="data/google/material_design_icons",
-    patterns=("variablefont/*.ttf",),
+    patterns=("font/*.ttf", "font/*.otf"),
 )
 ```
 
-### Source Han Sans（TTC 含む）
+### Source Han Code JP（TTC）
 
 ```python
 GlyphDataset(
-    root="data/adobe-fonts/source-han-sans",
-    patterns=("*.ttf.ttc",),
+    root="data/adobe/source-han-code-jp",
+    patterns=("OTC/*.ttc",),
 )
 ```
 
-::: info
-`*.ttf.ttc` は意図通りです。このリポジトリには `Something.ttf.ttc`
-のような名前の TTC ファイルがあります。
-:::
-
 ## 更新フロー
 
-Git 側で checkout を更新し、そのあと Dataset インスタンスを作り直します。
+Git 側で submodule checkout を更新し、そのあと Dataset インスタンスを作り直します。
 
 ```bash
-git -C data/fortawesome/font-awesome fetch --depth 1 origin
-git -C data/fortawesome/font-awesome checkout 7.x
+git submodule update --remote --depth 1 -- data/fortawesome/font-awesome
 ```
 
 TorchFont は Dataset オブジェクトの寿命中、ネイティブな indexing state を
