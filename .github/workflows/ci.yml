@@ -10,21 +10,27 @@ on:
       - '**/*.rs'
       - '**/*.py'
       - '**/*.pyi'
+      - 'tests/fonts/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'pyproject.toml'
       - 'uv.lock'
-      - '.github/workflows/*.yml'
+      - 'README.md'
+      - '.python-version'
+      - '.github/workflows/ci.yml'
   pull_request:
     paths:
       - '**/*.rs'
       - '**/*.py'
       - '**/*.pyi'
+      - 'tests/fonts/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'pyproject.toml'
       - 'uv.lock'
-      - '.github/workflows/*.yml'
+      - 'README.md'
+      - '.python-version'
+      - '.github/workflows/ci.yml'
   workflow_dispatch:
 
 permissions:
