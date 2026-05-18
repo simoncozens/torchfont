@@ -164,8 +164,8 @@ fn try_merge_quads_n(p0: Point, segs: &[PathElement]) -> Option<PathElement> {
 
 fn validate_quad_merge(p0: Point, p1: Point, p2: Point, segs: &[PathElement], ts: &[f32]) -> bool {
     let pieces = split_quad_at_ts(p0, p1, p2, ts);
-    for (k, (_rp0, rp1, rp2)) in pieces.iter().enumerate() {
-        let (orig_h, orig_end) = quad_points(segs[k]);
+    for ((_rp0, rp1, rp2), seg) in pieces.iter().zip(segs) {
+        let (orig_h, orig_end) = quad_points(*seg);
         if (*rp1 - orig_h).norm() > TOLERANCE || (*rp2 - orig_end).norm() > TOLERANCE {
             return false;
         }
@@ -287,8 +287,8 @@ fn validate_cubic_merge(
     let pieces = split_cubic_at_ts(p0, p1, p2, p3, ts);
     let mut prev_end = p0;
 
-    for (k, (rp0, rp1, rp2, rp3)) in pieces.iter().enumerate() {
-        let (orig_h1, orig_h2, orig_end) = cubic_points(segs[k]);
+    for ((rp0, rp1, rp2, rp3), seg) in pieces.iter().zip(segs) {
+        let (orig_h1, orig_h2, orig_end) = cubic_points(*seg);
 
         if (*rp3 - orig_end).norm() > TOLERANCE {
             return false;
@@ -381,7 +381,7 @@ fn can_merge_lines(start: Point, middle: Point, end: Point) -> bool {
     }
 
     let total = end - start;
-    let total_len = total.x.hypot(total.y);
+    let total_len = total.norm();
     if total_len < 1e-6 {
         return false;
     }
