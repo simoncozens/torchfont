@@ -23,35 +23,25 @@ fn merge_subpath_elements(start: Point, elements: Vec<PathElement>) -> Vec<PathE
 
     while i < n {
         let element = elements[i];
-        let seg_start = result
-            .last()
-            .map_or(start, |element: &PathElement| element.end());
+        let seg_start = result.last().map_or(start, |e: &PathElement| e.end());
 
         match element {
             PathElement::CurveTo { .. } => {
-                let mut run_end = i + 1;
-                while run_end < n && matches!(elements[run_end], PathElement::CurveTo { .. }) {
-                    run_end += 1;
-                }
-                let run_len = run_end - i;
-                let merged = (2..=run_len).rev().find_map(|len| {
-                    try_merge_cubics_n(seg_start, &elements[i..i + len]).map(|e| (e, len))
-                });
-                let (element, len) = merged.unwrap_or((element, 1));
+                let (element, len) = try_merge_run(
+                    seg_start, &elements, i, n,
+                    |e| matches!(e, PathElement::CurveTo { .. }),
+                    try_merge_cubics_n,
+                );
                 result.push(element);
                 result_starts.push(seg_start);
                 i += len;
             }
             PathElement::QuadTo { .. } => {
-                let mut run_end = i + 1;
-                while run_end < n && matches!(elements[run_end], PathElement::QuadTo { .. }) {
-                    run_end += 1;
-                }
-                let run_len = run_end - i;
-                let merged = (2..=run_len).rev().find_map(|len| {
-                    try_merge_quads_n(seg_start, &elements[i..i + len]).map(|e| (e, len))
-                });
-                let (element, len) = merged.unwrap_or((element, 1));
+                let (element, len) = try_merge_run(
+                    seg_start, &elements, i, n,
+                    |e| matches!(e, PathElement::QuadTo { .. }),
+                    try_merge_quads_n,
+                );
                 result.push(element);
                 result_starts.push(seg_start);
                 i += len;
@@ -77,6 +67,25 @@ fn merge_subpath_elements(start: Point, elements: Vec<PathElement>) -> Vec<PathE
     result
 }
 
+fn try_merge_run(
+    seg_start: Point,
+    elements: &[PathElement],
+    i: usize,
+    n: usize,
+    is_same: impl Fn(PathElement) -> bool,
+    try_merge: fn(Point, &[PathElement]) -> Option<PathElement>,
+) -> (PathElement, usize) {
+    let mut run_end = i + 1;
+    while run_end < n && is_same(elements[run_end]) {
+        run_end += 1;
+    }
+    let run_len = run_end - i;
+    (2..=run_len)
+        .rev()
+        .find_map(|len| try_merge(seg_start, &elements[i..i + len]).map(|e| (e, len)))
+        .unwrap_or((elements[i], 1))
+}
+
 fn quad_points(element: PathElement) -> (Point, Point) {
     match element {
         PathElement::QuadTo { control, end } => (control, end),
@@ -95,30 +104,26 @@ fn cubic_points(element: PathElement) -> (Point, Point, Point) {
     }
 }
 
-// Attempt to merge n consecutive quadratic segments into one.
-//
-// The split parameters can be recovered from adjacent tangent-length ratios in
-// the same way as cubics. A parent quadratic then has only one outer control
-// point to reconstruct and validate.
-fn try_merge_quads_n(p0: Point, segs: &[PathElement]) -> Option<PathElement> {
-    let n = segs.len();
-    debug_assert!(n >= 2);
-
+// Reconstruct normalized split parameters from cumulative tangent-length ratios
+// at each junction. ratio_k = |start_tan_k| / |end_tan_{k-1}|; ts_unnorm
+// accumulates partial sums and the last entry (= total) is discarded.
+// Returns None if any junction tangent is degenerate or forms a cusp.
+fn compute_split_ts(
+    n: usize,
+    junction_tangents: impl Fn(usize) -> (Point, Point),
+) -> Option<Vec<f32>> {
     let mut prod_ratio = 1.0_f32;
     let mut sum_ratio = 1.0_f32;
     let mut ts_unnorm = vec![1.0_f32];
 
     for k in 1..n {
-        let (prev_h, prev_end) = quad_points(segs[k - 1]);
-        let (curr_h, _curr_end) = quad_points(segs[k]);
-
-        let end_tan = prev_end - prev_h;
-        let start_tan = curr_h - prev_end;
+        let (end_tan, start_tan) = junction_tangents(k);
         let len_end = end_tan.norm();
         let len_start = start_tan.norm();
         if len_end < 1e-10 {
             return None;
         }
+        // Tangents at the junction must be parallel and in the same direction.
         if len_start > 1e-10 {
             if end_tan.cross(start_tan).abs() > TOLERANCE * len_end * len_start {
                 return None;
@@ -127,23 +132,36 @@ fn try_merge_quads_n(p0: Point, segs: &[PathElement]) -> Option<PathElement> {
                 return None;
             }
         }
-
         let ratio = len_start / len_end;
         prod_ratio *= ratio;
         sum_ratio += prod_ratio;
         ts_unnorm.push(sum_ratio);
     }
 
+    // ts has n-1 elements; ts[0] = t1 (first junction), ts[n-2] = t_{n-1} (last).
     ts_unnorm.pop();
-    let ts: Vec<f32> = ts_unnorm.iter().map(|&t| t / sum_ratio).collect();
+    Some(ts_unnorm.iter().map(|&t| t / sum_ratio).collect())
+}
+
+// Attempt to merge n consecutive quadratic segments into one.
+fn try_merge_quads_n(p0: Point, segs: &[PathElement]) -> Option<PathElement> {
+    let n = segs.len();
+    debug_assert!(n >= 2);
+
+    let ts = compute_split_ts(n, |k| {
+        let (prev_h, prev_end) = quad_points(segs[k - 1]);
+        let (curr_h, _) = quad_points(segs[k]);
+        (prev_end - prev_h, curr_h - prev_end)
+    })?;
+
     let t1 = ts[0];
     if !(1e-6..=1.0 - 1e-6).contains(&t1) {
         return None;
     }
 
-    let (first_h, _first_end) = quad_points(segs[0]);
+    let (first_h, _) = quad_points(segs[0]);
     let p1 = p0.lerp(first_h, 1.0 / t1);
-    let (_last_h, p2) = quad_points(segs[n - 1]);
+    let (_, p2) = quad_points(segs[n - 1]);
 
     if !validate_quad_merge(p0, p1, p2, segs, &ts) {
         return None;
@@ -176,7 +194,8 @@ fn split_quad_at_ts(p0: Point, p1: Point, p2: Point, ts: &[f32]) -> Vec<Quad> {
             return pieces;
         }
         let t_rel = (t - t_prev) / remaining;
-        let (left, right) = split_quad_at_t(current.0, current.1, current.2, t_rel);
+        let (p0, p1, p2) = current;
+        let (left, right) = split_quad_at_t(p0, p1, p2, t_rel);
         pieces.push(left);
         current = right;
         t_prev = t;
@@ -201,46 +220,11 @@ fn try_merge_cubics_n(p0: Point, segs: &[PathElement]) -> Option<PathElement> {
     let n = segs.len();
     debug_assert!(n >= 2);
 
-    // Compute cumulative tangent-length ratios at each junction.
-    // ratio_k = |start_tan_k| / |end_tan_{k-1}|
-    // ts_unnorm accumulates partial sums; the last entry is discarded (= total).
-    let mut prod_ratio = 1.0_f32;
-    let mut sum_ratio = 1.0_f32;
-    let mut ts_unnorm = vec![1.0_f32];
-
-    for k in 1..n {
-        let (_prev_h1, prev_h2, prev_end) = cubic_points(segs[k - 1]);
-        let (curr_h1, _curr_h2, _curr_end) = cubic_points(segs[k]);
-
-        let end_tan = prev_end - prev_h2;
-        let start_tan = curr_h1 - prev_end;
-
-        let len_end = end_tan.norm();
-        let len_start = start_tan.norm();
-
-        if len_end < 1e-10 {
-            return None;
-        }
-
-        // Tangents at the junction must be parallel and in the same direction.
-        if len_start > 1e-10 {
-            if end_tan.cross(start_tan).abs() > TOLERANCE * len_end * len_start {
-                return None;
-            }
-            if end_tan.dot(start_tan) < 0.0 {
-                return None; // anti-parallel (cusp)
-            }
-        }
-
-        let ratio = len_start / len_end;
-        prod_ratio *= ratio;
-        sum_ratio += prod_ratio;
-        ts_unnorm.push(sum_ratio);
-    }
-
-    // Normalize: ts has n-1 elements, ts[0] = t1 (first junction), ts[n-2] = t_{n-1} (last).
-    ts_unnorm.pop();
-    let ts: Vec<f32> = ts_unnorm.iter().map(|&t| t / sum_ratio).collect();
+    let ts = compute_split_ts(n, |k| {
+        let (_, prev_h2, prev_end) = cubic_points(segs[k - 1]);
+        let (curr_h1, _, _) = cubic_points(segs[k]);
+        (prev_end - prev_h2, curr_h1 - prev_end)
+    })?;
 
     let t1 = ts[0];
     let t_last = *ts.last().unwrap();
@@ -249,8 +233,8 @@ fn try_merge_cubics_n(p0: Point, segs: &[PathElement]) -> Option<PathElement> {
         return None;
     }
 
-    let (first_h1, _first_h2, _first_end) = cubic_points(segs[0]);
-    let (_last_h1, last_h2, p3) = cubic_points(segs[n - 1]);
+    let (first_h1, _, _) = cubic_points(segs[0]);
+    let (_, last_h2, p3) = cubic_points(segs[n - 1]);
 
     // Recover outer control points from the split relationship:
     //   first_h1 = lerp(P0, P1, t1)  →  P1 = P0 + (first_h1 − P0) / t1
@@ -316,7 +300,8 @@ fn split_cubic_at_ts(p0: Point, p1: Point, p2: Point, p3: Point, ts: &[f32]) -> 
             return pieces;
         }
         let t_rel = (t - t_prev) / remaining;
-        let (left, right) = split_cubic_at(current.0, current.1, current.2, current.3, t_rel);
+        let (p0, p1, p2, p3) = current;
+        let (left, right) = split_cubic_at(p0, p1, p2, p3, t_rel);
         pieces.push(left);
         current = right;
         t_prev = t;

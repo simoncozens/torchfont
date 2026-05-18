@@ -21,11 +21,10 @@ pub(crate) fn cubic_to_quad(outline: &Outline) -> Result<Outline, CubicToQuadErr
                     control1,
                     end,
                 } => {
-                    let p3 = end;
-                    for (qcp, end) in cubic_to_quads(prev, control0, control1, p3)? {
-                        elements.push(PathElement::QuadTo { control: qcp, end });
+                    for (qcp, quad_end) in cubic_to_quads(prev, control0, control1, end)? {
+                        elements.push(PathElement::QuadTo { control: qcp, end: quad_end });
                     }
-                    prev = p3;
+                    prev = end;
                 }
                 other => {
                     elements.push(other);
