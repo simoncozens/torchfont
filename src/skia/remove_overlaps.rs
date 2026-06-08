@@ -1,28 +1,38 @@
-use skia_safe::{Path, PathVerb};
+use skia_safe::{Path, PathFillType, PathVerb};
 
-use crate::geom::{Outline, PathElement, Point, Subpath};
+use crate::geom::{Outline, PathElement, Point, Subpath, reverse_subpath};
+
+// TorchFont outlines are normalized to roughly em-sized coordinates. PathOps is
+// more reliable at conventional font-unit magnitudes, so simplify a scaled copy.
+const PATHOPS_SCALE: f32 = 131_072.0;
 
 pub(crate) fn remove_overlaps(outline: &Outline) -> Outline {
-    let Some((path, _)) = super::build_skia_path(outline, false) else {
-        return outline.clone();
-    };
-    path.simplify().map_or_else(
-        || outline.clone(),
-        |simplified| outline_from_path(&simplified),
-    )
+    simplify(outline).unwrap_or_else(|| outline.clone())
 }
 
-fn outline_from_path(path: &Path) -> Outline {
+fn simplify(outline: &Outline) -> Option<Outline> {
+    let (path, _) = super::build_skia_path(outline, false, PathFillType::Winding)?;
+    let scaled = path.try_make_scale((PATHOPS_SCALE, PATHOPS_SCALE))?;
+    let simplified = scaled.simplify()?;
+
+    // Simplify emits an even-odd path. Reorient nested contours before
+    // returning to TorchFont, whose outlines use non-zero winding semantics.
+    let simplified = outline_from_path(&simplified)?;
+    let winding = winding_from_even_odd(&simplified)?;
+    Some(scale_outline(&winding, PATHOPS_SCALE.recip()))
+}
+
+fn outline_from_path(path: &Path) -> Option<Outline> {
     let mut subpaths = Vec::new();
     let mut start = None;
     let mut elements = Vec::new();
+
     for record in path.iter() {
         let points = record.points();
         match record.verb() {
             PathVerb::Move => {
-                if let Some(start) = start.replace(point(points[0])) {
-                    subpaths.push(Subpath::new(start, std::mem::take(&mut elements), false));
-                }
+                commit_subpath(&mut start, &mut elements, &mut subpaths, false);
+                start = Some(point(points[0]));
             }
             PathVerb::Line => elements.push(PathElement::LineTo(point(points[1]))),
             PathVerb::Quad => elements.push(PathElement::QuadTo {
@@ -35,19 +45,180 @@ fn outline_from_path(path: &Path) -> Outline {
                 end: point(points[3]),
             }),
             PathVerb::Close => {
-                if let Some(start) = start.take() {
-                    subpaths.push(Subpath::new(start, std::mem::take(&mut elements), true));
-                }
+                commit_subpath(&mut start, &mut elements, &mut subpaths, true);
             }
-            PathVerb::Conic => unreachable!("PathOps simplify should not emit conic segments"),
+            PathVerb::Conic => return None,
         }
     }
-    if let Some(start) = start {
-        subpaths.push(Subpath::new(start, elements, false));
+    commit_subpath(&mut start, &mut elements, &mut subpaths, false);
+
+    (!subpaths.is_empty()).then(|| Outline::new(subpaths))
+}
+
+fn commit_subpath(
+    start: &mut Option<Point>,
+    elements: &mut Vec<PathElement>,
+    subpaths: &mut Vec<Subpath>,
+    closed: bool,
+) {
+    if let Some(start) = start.take()
+        && !elements.is_empty()
+    {
+        subpaths.push(Subpath::new(start, std::mem::take(elements), closed));
     }
-    Outline::new(subpaths)
 }
 
 fn point(point: skia_safe::Point) -> Point {
     Point::new(point.x, point.y)
+}
+
+fn winding_from_even_odd(outline: &Outline) -> Option<Outline> {
+    // skia-pathops uses nesting depth instead of Skia's AsWinding operation;
+    // keep that behavior while using TorchFont's native outline types.
+    let mut contours: Vec<_> = outline
+        .subpaths()
+        .iter()
+        .map(|subpath| {
+            let path = subpath_path(subpath)?;
+            Some((subpath_area(subpath), path, subpath))
+        })
+        .collect::<Option<_>>()?;
+    contours.sort_by(|a, b| {
+        b.0.abs()
+            .partial_cmp(&a.0.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut nesting = vec![0usize; contours.len()];
+    for inner in 0..contours.len() {
+        for outer in 0..inner {
+            if path_is_inside(&contours[outer].1, &contours[inner].1) {
+                nesting[inner] += 1;
+            }
+        }
+    }
+
+    let subpaths = contours
+        .into_iter()
+        .zip(nesting)
+        .map(|((area, _, subpath), depth)| {
+            let is_clockwise = area < 0.0;
+            let is_outer = depth.is_multiple_of(2);
+            if is_clockwise == is_outer {
+                reverse_subpath(subpath)
+            } else {
+                subpath.clone()
+            }
+        })
+        .collect();
+    Some(Outline::new(subpaths))
+}
+
+fn subpath_path(subpath: &Subpath) -> Option<Path> {
+    super::build_skia_path(
+        &Outline::new(vec![subpath.clone()]),
+        false,
+        PathFillType::EvenOdd,
+    )
+    .map(|(path, _)| path)
+}
+
+fn path_is_inside(outer: &Path, inner: &Path) -> bool {
+    if !outer
+        .compute_tight_bounds()
+        .intersects(inner.compute_tight_bounds())
+    {
+        return false;
+    }
+
+    inner.iter().all(|record| {
+        let points = record.points();
+        match record.verb() {
+            PathVerb::Move => outer.contains(points[0]),
+            PathVerb::Line => outer.contains(points[1]),
+            PathVerb::Quad => outer.contains(points[2]),
+            PathVerb::Cubic => outer.contains(points[3]),
+            PathVerb::Close => true,
+            PathVerb::Conic => false,
+        }
+    })
+}
+
+fn subpath_area(subpath: &Subpath) -> f64 {
+    let start = subpath.start();
+    let mut previous = start;
+    let mut area = 0.0f64;
+
+    for element in subpath.elements() {
+        match *element {
+            PathElement::LineTo(end) => {
+                area -= ((end.x - previous.x) * (end.y + previous.y) * 0.5) as f64;
+                previous = end;
+            }
+            PathElement::QuadTo { control, end } => {
+                let control = control - previous;
+                let end_offset = end - previous;
+                area -= ((end_offset.x * control.y - control.x * end_offset.y) / 3.0) as f64;
+                area -= ((end.x - previous.x) * (end.y + previous.y) * 0.5) as f64;
+                previous = end;
+            }
+            PathElement::CurveTo {
+                control0,
+                control1,
+                end,
+            } => {
+                let control0 = control0 - previous;
+                let control1 = control1 - previous;
+                let end_offset = end - previous;
+                area -= (control0.x * (-control1.y - end_offset.y)
+                    + control1.x * (control0.y - 2.0 * end_offset.y)
+                    + end_offset.x * (control0.y + 2.0 * control1.y))
+                    as f64
+                    * 0.15;
+                area -= ((end.x - previous.x) * (end.y + previous.y) * 0.5) as f64;
+                previous = end;
+            }
+        }
+    }
+    area - ((start.x - previous.x) * (start.y + previous.y) * 0.5) as f64
+}
+
+fn scale_outline(outline: &Outline, scale: f32) -> Outline {
+    Outline::new(
+        outline
+            .subpaths()
+            .iter()
+            .map(|subpath| {
+                let elements = subpath
+                    .elements()
+                    .iter()
+                    .map(|element| match *element {
+                        PathElement::LineTo(end) => PathElement::LineTo(scale_point(end, scale)),
+                        PathElement::QuadTo { control, end } => PathElement::QuadTo {
+                            control: scale_point(control, scale),
+                            end: scale_point(end, scale),
+                        },
+                        PathElement::CurveTo {
+                            control0,
+                            control1,
+                            end,
+                        } => PathElement::CurveTo {
+                            control0: scale_point(control0, scale),
+                            control1: scale_point(control1, scale),
+                            end: scale_point(end, scale),
+                        },
+                    })
+                    .collect();
+                Subpath::new(
+                    scale_point(subpath.start(), scale),
+                    elements,
+                    subpath.is_closed(),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn scale_point(point: Point, scale: f32) -> Point {
+    Point::new(point.x * scale, point.y * scale)
 }

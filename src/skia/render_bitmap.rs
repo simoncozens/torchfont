@@ -1,4 +1,6 @@
-use skia_safe::{AlphaType, Color, ColorType, ImageInfo, Matrix, Paint, surfaces};
+use skia_safe::{
+    AlphaType, Color, ColorType, ImageInfo, Matrix, Paint, Path, PathFillType, surfaces,
+};
 
 use crate::geom::{Bounds, Outline};
 
@@ -27,8 +29,10 @@ pub(crate) fn render_bitmap(
     outline: &Outline,
     size: u32,
     mode: RenderMode,
+    fill_type: PathFillType,
 ) -> Result<RenderedBitmap, RenderBitmapError> {
-    let Some((path, bounds)) = super::build_skia_path(outline, !matches!(mode, RenderMode::Fixed))
+    let Some((path, bounds)) =
+        super::build_skia_path(outline, !matches!(mode, RenderMode::Fixed), fill_type)
     else {
         return Ok(blank_for_mode(size, mode));
     };
@@ -38,6 +42,15 @@ pub(crate) fn render_bitmap(
         return Ok(blank_for_mode(size, mode));
     };
 
+    let data = draw_alpha_path(&path, width, height, &matrix);
+    Ok(RenderedBitmap {
+        data,
+        width,
+        height,
+    })
+}
+
+fn draw_alpha_path(path: &Path, width: u32, height: u32, matrix: &Matrix) -> Vec<u8> {
     let mut data = vec![0u8; (width as usize).saturating_mul(height as usize)];
     let image_info = ImageInfo::new(
         (width as i32, height as i32),
@@ -47,23 +60,17 @@ pub(crate) fn render_bitmap(
     );
     let Some(mut surface) = surfaces::wrap_pixels(&image_info, &mut data, width as usize, None)
     else {
-        return Ok(blank_bitmap(width, height));
+        return vec![0u8; (width as usize).saturating_mul(height as usize)];
     };
     let canvas = surface.canvas();
-    canvas.clear(Color::TRANSPARENT);
-    canvas.concat(&matrix);
+    canvas.concat(matrix);
 
     let mut paint = Paint::default();
     paint.set_anti_alias(true);
     paint.set_color(Color::WHITE);
-    canvas.draw_path(&path, &paint);
+    canvas.draw_path(path, &paint);
     drop(surface);
-
-    Ok(RenderedBitmap {
-        data,
-        width,
-        height,
-    })
+    data
 }
 
 fn render_target(
